@@ -1,0 +1,22 @@
+// Shared Pusher logic
+function initPusher(examId, isTeacher = false) {
+    const pusher = new Pusher('YOUR_PUSHER_KEY', { cluster: 'YOUR_PUSHER_CLUSTER' });
+    const channel = pusher.subscribe(`exam-${examId}`);
+    
+    if (isTeacher) {
+        // Teacher events
+        channel.bind('student_joined', (data) => updateStudentCard(data.studentId, 'Joined', 'status-active'));
+        // ... other binds from TEACHER_HTML
+    } else {
+        // Student events
+        channel.bind('options_push', (data) => {
+            // Handle options from STUDENT_HTML
+        });
+        // ... other binds
+    }
+    
+    return channel;
+}
+
+// Export for use in HTML
+window.initPusher = initPusher;
