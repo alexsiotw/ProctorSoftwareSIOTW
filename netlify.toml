@@ -1,16 +1,14 @@
 [build]
-publish = "public"
-command = "pip install -r requirements.txt"  # For functions
+  publish = "public"
+  command = "pip install -r requirements.txt"
 
 [[redirects]]
-from = "/*"
-to = "/.netlify/functions/:splat"
-status = 200  # Route API calls to functions
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200
 
 [functions]
-directory = "functions"
-external_node_modules = false
-node_bundler = "esbuild"
+  directory = "functions"
 
 [[plugins]]
-package = "@netlify/plugin-functions-core-python"  # For Python functions
+  package = "@netlify/plugin-functions-core-python"
