@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: proctoring-app
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -k eventlet -w 1 --bind 0.0.0.0:$PORT app:app
