@@ -88,6 +88,7 @@ TEACHER_HTML = """
         .status-active { background-color: green; }
         .status-tab-changed { background-color: orange; }
         .status-disconnected { background-color: red; }
+        .audio-player { max-width: 100%; }
     </style>
 </head>
 <body class="container mt-5">
@@ -113,7 +114,10 @@ TEACHER_HTML = """
     <script>
         const socket = io();
         let examId;
-        socket.on('connect', () => socket.emit('join_teacher', {examId}));
+        socket.on('connect', () => {
+            console.log('Teacher connected to WebSocket');
+            socket.emit('join_teacher', {examId});
+        });
 
         document.getElementById('createExam').onclick = () => {
             fetch('/create_exam').then(res => res.json()).then(data => {
@@ -157,6 +161,10 @@ TEACHER_HTML = """
             updateStudentCard(data.studentId, 'Active', 'status-active', data.screenshot, data.timestamp);
         });
 
+        socket.on('audio_chunk', (data) => {
+            updateStudentCard(data.studentId, 'Active', 'status-active', null, data.timestamp, data.audio);
+        });
+
         socket.on('recording_saved', (data) => {
             document.getElementById('recordings').innerHTML += `<div class="alert alert-info">Recording saved: <a href="/download/${data.filename}" target="_blank">${data.filename}</a></div>`;
         });
@@ -165,7 +173,7 @@ TEACHER_HTML = """
             updateStudentCard(data.studentId, 'Disconnected', 'status-disconnected');
         });
 
-        function updateStudentCard(studentId, status, statusClass, screenshot = null, timestamp = null) {
+        function updateStudentCard(studentId, status, statusClass, screenshot = null, timestamp = null, audio = null) {
             let card = document.getElementById(`student-${studentId}`);
             if (!card) {
                 card = document.createElement('div');
@@ -179,6 +187,7 @@ TEACHER_HTML = """
                     <div class="card-body">
                         <p>Status: <span class="status-indicator ${statusClass}">${status}</span></p>
                         ${screenshot ? `<img src="data:image/png;base64,${screenshot}" class="card-img-top" alt="Screenshot" style="max-width: 100%;">` : ''}
+                        ${audio ? `<audio class="audio-player" controls><source src="data:audio/webm;base64,${audio}" type="audio/webm"></audio>` : ''}
                         ${timestamp ? `<p>Last Update: ${timestamp}</p>` : ''}
                     </div>
                 </div>`;
@@ -198,9 +207,25 @@ STUDENT_HTML = """
 </head>
 <body class="container mt-5">
     <h1>Online Exam</h1>
-    <div id="optionsConfirm" class="alert alert-info" style="display:none;"></div>
-    <button id="confirmOptions" class="btn btn-success" style="display:none;">Confirm and Start Exam</button>
-    <iframe id="testIframe" src="https://docs.google.com/forms/YOUR_GOOGLE_FORM_ID/viewform?embedded=true" width="100%" height="600" style="display:none; border:none;"></iframe>
+    <div id="optionsConfirm" class="alert alert-info" style="display:none;">
+        <h3>Proctoring Options</h3>
+        <form id="proctoringForm">
+            <div class="form-check">
+                <input type="checkbox" class="form-check-input" id="camera" disabled>
+                <label class="form-check-label" for="camera">Camera</label>
+            </div>
+            <div class="form-check">
+                <input type="checkbox" class="form-check-input" id="mic" disabled>
+                <label class="form-check-label" for="mic">Mic</label>
+            </div>
+            <div class="form-check">
+                <input type="checkbox" class="form-check-input" id="screen" disabled>
+                <label class="form-check-label" for="screen">Screen Share</label>
+            </div>
+            <button type="button" id="confirmOptions" class="btn btn-success mt-3">Start Exam</button>
+        </form>
+    </div>
+    <iframe id="testIframe" src="https://docs.google.com/forms/d/e/hU5tRVMcBS9GX8Mu5/viewform?embedded=true" width="100%" height="600" style="display:none; border:none;"></iframe>
     <div id="status" class="alert alert-warning mt-3"></div>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <script src="https://html2canvas.hertzen.com/dist/html2canvas.min.js"></script>
@@ -217,6 +242,8 @@ STUDENT_HTML = """
         let streams = {};
         let mediaRecorder;
         let recordedChunks = [];
+        let audioRecorder;
+        let audioChunks = [];
         let chunkSize = 1024 * 1024; // 1MB
         let currentChunk = 0;
         let totalChunks = 0;
@@ -225,23 +252,26 @@ STUDENT_HTML = """
         socket.on('options_push', (data) => {
             options = data;
             console.log('Received options:', options);
-            let html = '<h3>Proctoring Options (Confirm to Start):</h3><ul>';
-            for (let key in options) if (options[key]) html += `<li>${key.charAt(0).toUpperCase() + key.slice(1).replace(/([A-Z])/g, ' $1')}</li>`;
-            html += '</ul>';
-            document.getElementById('optionsConfirm').innerHTML = html;
+            const cameraCheckbox = document.getElementById('camera');
+            const micCheckbox = document.getElementById('mic');
+            const screenCheckbox = document.getElementById('screen');
+            cameraCheckbox.checked = options.camera;
+            micCheckbox.checked = options.mic;
+            screenCheckbox.checked = options.screen;
             document.getElementById('optionsConfirm').style.display = 'block';
-            document.getElementById('confirmOptions').style.display = 'block';
         });
 
         document.getElementById('confirmOptions').onclick = async () => {
             socket.emit('options_confirmed', {examId, studentId});
             document.getElementById('optionsConfirm').style.display = 'none';
-            document.getElementById('confirmOptions').style.display = 'none';
             document.getElementById('testIframe').style.display = 'block';
             await initMedia();
             document.getElementById('status').innerHTML = 'Exam Started - Do not switch tabs or leave the page!';
-            if (options.record) mediaRecorder.start();
-            if (options.screen) screenshotInterval = setInterval(captureScreenshot, 5000);
+            if (options.record && (streams.camera || streams.mic || streams.screen)) mediaRecorder.start();
+            if (options.mic) {
+                audioRecorder.start(10000); // Send audio every 10s
+            }
+            if (options.screen || options.camera) screenshotInterval = setInterval(captureScreenshot, 5000);
         };
 
         async function initMedia() {
@@ -253,6 +283,18 @@ STUDENT_HTML = """
                 if (options.mic) {
                     streams.mic = await navigator.mediaDevices.getUserMedia({audio: true});
                     console.log('Mic access granted');
+                    const audioStream = new MediaStream(streams.mic.getAudioTracks());
+                    audioRecorder = new MediaRecorder(audioStream, {mimeType: 'audio/webm'});
+                    audioRecorder.ondataavailable = async (event) => {
+                        if (event.data.size > 0) {
+                            const reader = new FileReader();
+                            reader.onload = () => {
+                                const audio = reader.result.split(',')[1];
+                                socket.emit('audio_chunk', {examId, studentId, audio, timestamp: new Date().toISOString()});
+                            };
+                            reader.readAsDataURL(event.data);
+                        }
+                    };
                 }
                 if (options.screen) {
                     streams.screen = await navigator.mediaDevices.getDisplayMedia({video: true});
@@ -282,6 +324,7 @@ STUDENT_HTML = """
             } catch (err) {
                 console.error('Media access error:', err);
                 alert('Media access denied: ' + err.message);
+                document.getElementById('status').innerHTML = 'Error: Media access denied. Please allow permissions and try again.';
             }
         }
 
@@ -319,7 +362,7 @@ STUDENT_HTML = """
 
         async function captureScreenshot() {
             try {
-                const canvas = await html2canvas(document.body, {scale: 0.5}); // Reduced scale for performance
+                const canvas = await html2canvas(document.body, {scale: 0.5});
                 const dataUrl = canvas.toDataURL('image/png');
                 const screenshot = dataUrl.split(',')[1];
                 socket.emit('screenshot', {examId, studentId, screenshot, timestamp: new Date().toISOString()});
@@ -330,6 +373,7 @@ STUDENT_HTML = """
 
         window.onbeforeunload = () => {
             if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+            if (audioRecorder && audioRecorder.state === 'recording') audioRecorder.stop();
             if (screenshotInterval) clearInterval(screenshotInterval);
             socket.emit('student_leave', {examId, studentId});
         };
@@ -337,6 +381,7 @@ STUDENT_HTML = """
         socket.on('exam_ended', () => {
             alert('Exam ended by teacher.');
             if (mediaRecorder) mediaRecorder.stop();
+            if (audioRecorder) audioRecorder.stop();
             if (screenshotInterval) clearInterval(screenshotInterval);
             window.location = '/login';
         });
@@ -490,6 +535,10 @@ def heartbeat(data):
 @socketio.on('screenshot')
 def screenshot(data):
     emit('screenshot', data, room=data['examId'])
+
+@socketio.on('audio_chunk')
+def audio_chunk(data):
+    emit('audio_chunk', data, room=data['examId'])
 
 @socketio.on('student_leave')
 def student_leave(data):
