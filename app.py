@@ -1,21 +1,21 @@
-Python 3.13.7 (tags/v3.13.7:bcee1c3, Aug 14 2025, 14:15:11) [MSC v.1944 64 bit (AMD64)] on win32
-Enter "help" below or click "Help" above for more information.
-# Complete Anti-Cheat Exam Proctoring System
-# Enhanced version with:
-# - SQLite database for persistence (exams, students, recordings metadata).
-# - Chunked video upload to avoid base64 limits (JS sends blobs in chunks).
-# - Periodic screenshot emission for real-time screen proctoring (if screen share enabled).
-# - Basic authentication (hardcoded for simplicity: teacher 'admin'/pass, students no login).
-# - Improved UI with Bootstrap.
-# - End-exam functionality.
-# - No mobile optimizations.
+# Anti-Cheat Exam Proctoring System (Fixed for Render.com)
+# - Uses gthread worker for gunicorn (no eventlet).
+# - SQLite for exam/student/recording metadata.
+# - Chunked video uploads, periodic screenshots (html2canvas), tab detection.
+# - Bootstrap UI, teacher auth (admin/password), embedded Google Form.
+# - No mobile support, optimized for desktop.
 #
 # Setup:
-# 1. pip install flask flask-socketio eventlet gunicorn sqlite3 html2canvas (wait, html2canvas is JS lib, add via CDN).
-# 2. Run locally: gunicorn -k eventlet -w 1 app:app
-# 3. For Render.com deployment: See guide below.
-# 4. Replace GOOGLE_FORM_URL with your embedded form URL.
-# 5. Recordings saved in /recordings/ dir (create it).
+# 1. Save as app.py.
+# 2. Create recordings/ folder (for local testing; Render needs Disks/S3).
+# 3. requirements.txt:
+#     flask==2.3.3
+#     flask-socketio==5.3.6
+#     gunicorn==21.2.0
+#     werkzeug==2.3.7
+#     setuptools==75.2.0
+# 4. Replace YOUR_GOOGLE_FORM_ID in STUDENT_HTML.
+# 5. Deploy to Render.com (see below).
 
 import os
 import uuid
@@ -30,7 +30,7 @@ app = Flask(__name__)
 app.secret_key = 'your_super_secret_key_change_me'
 app.config['UPLOAD_FOLDER'] = 'recordings'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')  # Changed to threading
 
 # SQLite setup
 DB_FILE = 'proctoring.db'
@@ -48,11 +48,11 @@ def init_db():
 
 init_db()
 
-# Hardcoded auth (use JWT or OAuth in prod)
+# Hardcoded auth
 TEACHER_USER = 'admin'
 TEACHER_PASS = 'password'
 
-# HTML Templates (with Bootstrap for better UI)
+# HTML Templates
 LOGIN_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -71,6 +71,8 @@ LOGIN_HTML = """
                 <button type="submit" class="btn btn-primary w-100">Login</button>
             </form>
             <div id="message" class="mt-3"></div>
+            <p class="mt-3">Student? Enter exam ID: <input id="examId" class="form-control d-inline w-auto" placeholder="Exam ID">
+            <button onclick="window.location='/student?examId='+document.getElementById('examId').value" class="btn btn-secondary">Join Exam</button></p>
         </div>
     </div>
     <script>
@@ -117,28 +119,32 @@ TEACHER_HTML = """
         <div id="examId" class="alert alert-info mt-3"></div>
         <div id="students" class="mt-3"></div>
         <div id="recordings" class="mt-3"></div>
-        <div id="proctorFeed" class="row mt-3"></div> <!-- For screenshots -->
+        <div id="proctorFeed" class="row mt-3"></div>
     </div>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         const socket = io();
         let examId;
-        socket.on('connect', () => socket.emit('join_teacher', examId));
+        socket.on('connect', () => socket.emit('join_teacher', {examId}));
 
         document.getElementById('createExam').onclick = () => {
             fetch('/create_exam').then(res => res.json()).then(data => {
                 examId = data.exam_id;
                 document.getElementById('examControls').style.display = 'block';
                 document.getElementById('examId').innerHTML = `Exam ID: ${examId} (Share with students)`;
-                socket.emit('set_exam', examId);
+                socket.emit('set_exam', {examId});
             });
         };
 
         document.getElementById('startExam').onclick = () => {
-            const options = {camera: document.getElementById('camera').checked, mic: document.getElementById('mic').checked,
-                            screen: document.getElementById('screen').checked, tabDetect: document.getElementById('tabDetect').checked,
-                            record: document.getElementById('record').checked};
+            const options = {
+                camera: document.getElementById('camera').checked,
+                mic: document.getElementById('mic').checked,
+                screen: document.getElementById('screen').checked,
+                tabDetect: document.getElementById('tabDetect').checked,
+                record: document.getElementById('record').checked
+            };
             socket.emit('start_exam', {examId, options});
             document.getElementById('endExam').style.display = 'inline-block';
         };
@@ -187,7 +193,7 @@ STUDENT_HTML = """
     <h1>Online Exam</h1>
     <div id="optionsConfirm" class="alert alert-info" style="display:none;"></div>
     <button id="confirmOptions" class="btn btn-success" style="display:none;">Confirm and Start Exam</button>
-    <iframe id="testIframe" src="https://docs.google.com/forms/YOUR_GOOGLE_FORM_ID/viewform?embedded=true" width="100%" height="600" style="display:none; border:none;"></iframe>
+    <iframe id="testIframe" src="https://docs.google.com/forms/3vUkvoZZVD81RRRf9/viewform?embedded=true" width="100%" height="600" style="display:none; border:none;"></iframe>
     <div id="status" class="alert alert-warning mt-3"></div>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <script src="https://html2canvas.hertzen.com/dist/html2canvas.min.js"></script>
@@ -204,7 +210,7 @@ STUDENT_HTML = """
         let streams = {};
         let mediaRecorder;
         let recordedChunks = [];
-        let chunkSize = 1024 * 1024; // 1MB chunks
+        let chunkSize = 1024 * 1024; // 1MB
         let currentChunk = 0;
         let totalChunks = 0;
         let screenshotInterval;
@@ -221,6 +227,7 @@ STUDENT_HTML = """
 
         document.getElementById('confirmOptions').onclick = async () => {
             socket.emit('options_confirmed', {examId, studentId});
+            document.getElementById('optionsConfirm').style.display = 'none';
             document.getElementById('confirmOptions').style.display = 'none';
             document.getElementById('testIframe').style.display = 'block';
             await initMedia();
@@ -285,14 +292,18 @@ STUDENT_HTML = """
                 if (data.success && chunkIndex < totalChunks - 1) {
                     uploadChunk(blob, chunkIndex + 1);
                 }
-            });
+            }).catch(err => alert('Upload failed: ' + err.message));
         }
 
         async function captureScreenshot() {
-            const canvas = await html2canvas(document.body);
-            const dataUrl = canvas.toDataURL('image/png');
-            const screenshot = dataUrl.split(',')[1];
-            socket.emit('screenshot', {examId, studentId, screenshot, timestamp: new Date().toISOString()});
+            try {
+                const canvas = await html2canvas(document.body);
+                const dataUrl = canvas.toDataURL('image/png');
+                const screenshot = dataUrl.split(',')[1];
+                socket.emit('screenshot', {examId, studentId, screenshot, timestamp: new Date().toISOString()});
+            } catch (err) {
+                console.error('Screenshot failed:', err);
+            }
         }
 
         window.onbeforeunload = () => {
@@ -304,6 +315,7 @@ STUDENT_HTML = """
         socket.on('exam_ended', () => {
             alert('Exam ended by teacher.');
             if (mediaRecorder) mediaRecorder.stop();
+            if (screenshotInterval) clearInterval(screenshotInterval);
         });
     </script>
 </body>
@@ -320,9 +332,7 @@ def login():
     if data['username'] == TEACHER_USER and data['password'] == TEACHER_PASS:
         session['is_teacher'] = True
         return jsonify({'success': True, 'is_teacher': True})
-    else:
-        session['is_teacher'] = False
-        return jsonify({'success': True, 'is_teacher': False})  # Students no pass needed
+    return jsonify({'success': False})
 
 @app.route('/teacher')
 def teacher():
@@ -334,12 +344,14 @@ def teacher():
 def student():
     exam_id = request.args.get('examId')
     if not exam_id:
-        return 'Invalid Exam ID', 400
+        return redirect(url_for('login'))
     student_id = str(uuid.uuid4())[:8]
     return render_template_string(STUDENT_HTML, student_id=student_id)
 
 @app.route('/create_exam')
 def create_exam():
+    if not session.get('is_teacher'):
+        return jsonify({'error': 'Unauthorized'}, 401)
     exam_id = str(uuid.uuid4())[:8]
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -359,31 +371,35 @@ def upload_chunk():
     secure_name = secure_filename(filename)
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], secure_name)
 
-    with open(filepath, 'ab') as f:
-        f.seek(chunk_index * int(request.form.get('chunkSize', 1024*1024)))
-        chunk.save(f)
+    try:
+        with open(filepath, 'ab') as f:
+            f.seek(chunk_index * (1024 * 1024))  # 1MB chunks
+            chunk.save(f)
 
-    if chunk_index == total_chunks - 1:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("INSERT INTO recordings (id, exam_id, student_id, filename, uploaded_at) VALUES (?, ?, ?, ?, ?)",
-                  (str(uuid.uuid4())[:8], exam_id, student_id, secure_name, datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
-        socketio.emit('recording_saved', {'filename': secure_name}, room=exam_id)
-
-    return jsonify({'success': True})
+        if chunk_index == total_chunks - 1:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("INSERT INTO recordings (id, exam_id, student_id, filename, uploaded_at) VALUES (?, ?, ?, ?, ?)",
+                      (str(uuid.uuid4())[:8], exam_id, student_id, secure_name, datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+            socketio.emit('recording_saved', {'filename': secure_name}, room=exam_id)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/download/<filename>')
 def download(filename):
+    if not session.get('is_teacher'):
+        return jsonify({'error': 'Unauthorized'}, 401)
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 @socketio.on('join_teacher')
 def on_join_teacher(data):
-    global exam_id  # From set_exam
     exam_id = data.get('examId')
-    join_room(exam_id)
-    emit('status', {'msg': 'Joined'})
+    if exam_id:
+        join_room(exam_id)
+        emit('status', {'msg': 'Joined'})
 
 @socketio.on('set_exam')
 def set_exam(data):
@@ -400,16 +416,16 @@ def on_join_student(data):
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO students (id, exam_id, joined_at) VALUES (?, ?, ?)",
               (student_id, exam_id, datetime.now().isoformat()))
+    c.execute("SELECT options FROM exams WHERE id=?", (exam_id,))
+    row = c.fetchone()
     conn.commit()
     conn.close()
     
     emit('student_joined', {'studentId': student_id}, room=exam_id)
-    
-    c.execute("SELECT options FROM exams WHERE id=?", (exam_id,))
-    row = c.fetchone()
     if row and row[0]:
-        options = eval(row[0])  # Unsafe, use JSON in prod
-        emit('options_push', options, room=socketio.sid)  # To this student
+        import json
+        options = json.loads(row[0])  # Safer than eval
+        emit('options_push', options, to=exam_id)
 
 @socketio.on('start_exam')
 def start_exam(data):
@@ -417,47 +433,49 @@ def start_exam(data):
     options = data['options']
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("UPDATE exams SET options=?, active=1 WHERE id=?", (str(options), exam_id))
+    import json
+    c.execute("UPDATE exams SET options=?, active=1 WHERE id=?", (json.dumps(options), exam_id))
     conn.commit()
     conn.close()
     emit('exam_started', {'examId': exam_id}, room=exam_id)
-    # Push to all students in room
+    emit('options_push', options, room=exam_id)
 
 @socketio.on('end_exam')
 def end_exam(data):
-...     exam_id = data['examId']
-...     conn = sqlite3.connect(DB_FILE)
-...     c = conn.cursor()
-...     c.execute("UPDATE exams SET active=0 WHERE id=?", (exam_id,))
-...     conn.commit()
-...     conn.close()
-...     emit('exam_ended', {}, room=exam_id)
-... 
-... @socketio.on('options_confirmed')
-... def options_confirmed(data):
-...     emit('status', {'msg': f'Student {data["studentId"]} confirmed'}, room=data['examId'])
-... 
-... @socketio.on('tab_changed')
-... def tab_changed(data):
-...     emit('tab_change', {'studentId': data['studentId']}, room=data['examId'])
-... 
-... @socketio.on('heartbeat')
-... def heartbeat(data):
-...     pass  # Ack
-... 
-... @socketio.on('screenshot')
-... def screenshot(data):
-...     emit('screenshot', data, room=data['examId'])
-... 
-... @socketio.on('student_leave')
-... def student_leave(data):
-...     exam_id = data['examId']
-...     student_id = data['studentId']
-...     leave_room(exam_id)
-...     conn = sqlite3.connect(DB_FILE)
-...     c = conn.cursor()
-...     c.execute("DELETE FROM students WHERE id=? AND exam_id=?", (student_id, exam_id))
-...     conn.commit()
-...     conn.close()
-... 
-... if __name__ == '__main__':
+    exam_id = data['examId']
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE exams SET active=0 WHERE id=?", (exam_id,))
+    conn.commit()
+    conn.close()
+    emit('exam_ended', {}, room=exam_id)
+
+@socketio.on('options_confirmed')
+def options_confirmed(data):
+    emit('status', {'msg': f'Student {data["studentId"]} confirmed'}, room=data['examId'])
+
+@socketio.on('tab_changed')
+def tab_changed(data):
+    emit('tab_change', {'studentId': data['studentId']}, room=data['examId'])
+
+@socketio.on('heartbeat')
+def heartbeat(data):
+    pass
+
+@socketio.on('screenshot')
+def screenshot(data):
+    emit('screenshot', data, room=data['examId'])
+
+@socketio.on('student_leave')
+def student_leave(data):
+    exam_id = data['examId']
+    student_id = data['studentId']
+    leave_room(exam_id)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM students WHERE id=? AND exam_id=?", (student_id, exam_id))
+    conn.commit()
+    conn.close()
+
+if __name__ == '__main__':
+    socketio.run(app, debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
