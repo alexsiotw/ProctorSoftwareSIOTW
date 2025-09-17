@@ -173,6 +173,10 @@ TEACHER_HTML = """
             updateStudentCard(data.studentId, 'Disconnected', 'status-disconnected');
         });
 
+        socket.on('status', (data) => {
+            console.log('Status:', data.msg);
+        });
+
         function updateStudentCard(studentId, status, statusClass, screenshot = null, timestamp = null, audio = null) {
             let card = document.getElementById(`student-${studentId}`);
             if (!card) {
@@ -226,7 +230,7 @@ STUDENT_HTML = """
         </form>
     </div>
     <iframe id="testIframe" src="https://docs.google.com/forms/d/e/hU5tRVMcBS9GX8Mu5/viewform?embedded=true" width="100%" height="600" style="display:none; border:none;"></iframe>
-    <div id="status" class="alert alert-warning mt-3"></div>
+    <div id="status" class="alert alert-warning mt-3">Waiting for exam to start...</div>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <script src="https://html2canvas.hertzen.com/dist/html2canvas.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
@@ -235,23 +239,31 @@ STUDENT_HTML = """
         const urlParams = new URLSearchParams(window.location.search);
         const examId = urlParams.get('examId');
         const studentId = '{{ student_id }}';
-        if (!examId) { alert('No Exam ID provided'); window.location = '/login'; return; }
-        socket.emit('join_student', {examId, studentId});
+        if (!examId) {
+            alert('No Exam ID provided');
+            window.location = '/login';
+            return;
+        }
 
-        let options = {};
-        let streams = {};
-        let mediaRecorder;
-        let recordedChunks = [];
-        let audioRecorder;
-        let audioChunks = [];
-        let chunkSize = 1024 * 1024; // 1MB
-        let currentChunk = 0;
-        let totalChunks = 0;
-        let screenshotInterval;
+        function joinExam() {
+            console.log('Joining exam:', examId, studentId);
+            socket.emit('join_student', {examId, studentId});
+        }
+
+        socket.on('connect', () => {
+            console.log('Student connected to WebSocket');
+            joinExam();
+        });
+
+        socket.on('connect_error', (err) => {
+            console.error('WebSocket connection error:', err);
+            document.getElementById('status').innerHTML = 'Connection error. Retrying...';
+            setTimeout(joinExam, 3000);
+        });
 
         socket.on('options_push', (data) => {
-            options = data;
-            console.log('Received options:', options);
+            console.log('Received options:', data);
+            const options = data;
             const cameraCheckbox = document.getElementById('camera');
             const micCheckbox = document.getElementById('mic');
             const screenCheckbox = document.getElementById('screen');
@@ -259,18 +271,29 @@ STUDENT_HTML = """
             micCheckbox.checked = options.mic;
             screenCheckbox.checked = options.screen;
             document.getElementById('optionsConfirm').style.display = 'block';
+            document.getElementById('status').innerHTML = 'Please confirm proctoring options to start the exam.';
         });
 
+        let options = {};
+        let streams = {};
+        let mediaRecorder;
+        let audioRecorder;
+        let recordedChunks = [];
+        let audioChunks = [];
+        let chunkSize = 1024 * 1024; // 1MB
+        let currentChunk = 0;
+        let totalChunks = 0;
+        let screenshotInterval;
+
         document.getElementById('confirmOptions').onclick = async () => {
+            console.log('Start Exam clicked');
             socket.emit('options_confirmed', {examId, studentId});
             document.getElementById('optionsConfirm').style.display = 'none';
             document.getElementById('testIframe').style.display = 'block';
             await initMedia();
             document.getElementById('status').innerHTML = 'Exam Started - Do not switch tabs or leave the page!';
             if (options.record && (streams.camera || streams.mic || streams.screen)) mediaRecorder.start();
-            if (options.mic) {
-                audioRecorder.start(10000); // Send audio every 10s
-            }
+            if (options.mic) audioRecorder.start(10000); // Send audio every 10s
             if (options.screen || options.camera) screenshotInterval = setInterval(captureScreenshot, 5000);
         };
 
@@ -324,7 +347,7 @@ STUDENT_HTML = """
             } catch (err) {
                 console.error('Media access error:', err);
                 alert('Media access denied: ' + err.message);
-                document.getElementById('status').innerHTML = 'Error: Media access denied. Please allow permissions and try again.';
+                document.getElementById('status').innerHTML = 'Error: Media access denied. Please allow permissions and refresh.';
             }
         }
 
@@ -428,6 +451,7 @@ def create_exam():
     c.execute("INSERT INTO exams (id, active, created_at) VALUES (?, 0, ?)", (exam_id, datetime.now().isoformat()))
     conn.commit()
     conn.close()
+    app.logger.info(f'Exam created: {exam_id}')
     return jsonify({'exam_id': exam_id})
 
 @app.route('/upload_chunk', methods=['POST'])
@@ -454,8 +478,10 @@ def upload_chunk():
             conn.commit()
             conn.close()
             socketio.emit('recording_saved', {'filename': secure_name}, room=exam_id)
+            app.logger.info(f'Recording saved: {secure_name} for student {student_id} in exam {exam_id}')
         return jsonify({'success': True})
     except Exception as e:
+        app.logger.error(f'Upload chunk failed: {str(e)}')
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/download/<filename>')
@@ -469,12 +495,14 @@ def on_join_teacher(data):
     exam_id = data.get('examId')
     if exam_id:
         join_room(exam_id)
-        emit('status', {'msg': 'Teacher joined'})
+        emit('status', {'msg': 'Teacher joined'}, room=exam_id)
+        app.logger.info(f'Teacher joined exam: {exam_id}')
 
 @socketio.on('set_exam')
 def set_exam(data):
     global exam_id
     exam_id = data['examId']
+    app.logger.info(f'Exam set: {exam_id}')
 
 @socketio.on('join_student')
 def on_join_student(data):
@@ -491,11 +519,15 @@ def on_join_student(data):
     conn.commit()
     conn.close()
     
+    app.logger.info(f'Student {student_id} joined exam {exam_id}')
     emit('student_joined', {'studentId': student_id}, room=exam_id)
     if row and row[0]:
         import json
         options = json.loads(row[0])
-        emit('options_push', options, to=exam_id)
+        emit('options_push', options, room=exam_id)
+        app.logger.info(f'Pushed options to exam {exam_id}: {options}')
+    else:
+        app.logger.warning(f'No options found for exam {exam_id}')
 
 @socketio.on('start_exam')
 def start_exam(data):
@@ -509,6 +541,7 @@ def start_exam(data):
     conn.close()
     emit('exam_started', {'examId': exam_id}, room=exam_id)
     emit('options_push', options, room=exam_id)
+    app.logger.info(f'Exam {exam_id} started with options: {options}')
 
 @socketio.on('end_exam')
 def end_exam(data):
@@ -519,14 +552,17 @@ def end_exam(data):
     conn.commit()
     conn.close()
     emit('exam_ended', {}, room=exam_id)
+    app.logger.info(f'Exam {exam_id} ended')
 
 @socketio.on('options_confirmed')
 def options_confirmed(data):
     emit('status', {'msg': f'Student {data["studentId"]} confirmed'}, room=data['examId'])
+    app.logger.info(f'Student {data["studentId"]} confirmed options for exam {data["examId"]}')
 
 @socketio.on('tab_changed')
 def tab_changed(data):
     emit('tab_change', {'studentId': data['studentId']}, room=data['examId'])
+    app.logger.info(f'Student {data["studentId"]} changed tab in exam {data["examId"]}')
 
 @socketio.on('heartbeat')
 def heartbeat(data):
@@ -535,10 +571,12 @@ def heartbeat(data):
 @socketio.on('screenshot')
 def screenshot(data):
     emit('screenshot', data, room=data['examId'])
+    app.logger.info(f'Screenshot received from student {data["studentId"]} in exam {data["examId"]}')
 
 @socketio.on('audio_chunk')
 def audio_chunk(data):
     emit('audio_chunk', data, room=data['examId'])
+    app.logger.info(f'Audio chunk received from student {data["studentId"]} in exam {data["examId"]}')
 
 @socketio.on('student_leave')
 def student_leave(data):
@@ -551,6 +589,7 @@ def student_leave(data):
     conn.commit()
     conn.close()
     emit('student_leave', {'studentId': student_id}, room=exam_id)
+    app.logger.info(f'Student {student_id} left exam {exam_id}')
 
 if __name__ == '__main__':
     socketio.run(app, debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
