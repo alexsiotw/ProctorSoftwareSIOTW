@@ -1,5 +1,5 @@
 # Anti-Cheat Exam Proctoring System (Fixed for Render.com)
-# - Uses gthread worker for gunicorn (no eventlet).
+# - Uses gthread worker for gunicorn.
 # - SQLite for exam/student/recording metadata.
 # - Chunked video uploads, periodic screenshots (html2canvas), tab detection.
 # - Bootstrap UI, teacher auth (admin/password), embedded Google Form.
@@ -7,7 +7,7 @@
 #
 # Setup:
 # 1. Save as app.py.
-# 2. Create recordings/ folder (for local testing; Render needs Disks/S3).
+# 2. Create recordings/ folder (use Render Disk for persistence).
 # 3. requirements.txt:
 #     flask==2.3.3
 #     flask-socketio==5.3.6
@@ -19,7 +19,6 @@
 
 import os
 import uuid
-import base64
 import sqlite3
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for, send_from_directory
@@ -30,7 +29,7 @@ app = Flask(__name__)
 app.secret_key = 'your_super_secret_key_change_me'
 app.config['UPLOAD_FOLDER'] = 'recordings'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')  # Changed to threading
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # SQLite setup
 DB_FILE = 'proctoring.db'
@@ -193,7 +192,7 @@ STUDENT_HTML = """
     <h1>Online Exam</h1>
     <div id="optionsConfirm" class="alert alert-info" style="display:none;"></div>
     <button id="confirmOptions" class="btn btn-success" style="display:none;">Confirm and Start Exam</button>
-    <iframe id="testIframe" src="https://docs.google.com/forms/3vUkvoZZVD81RRRf9/viewform?embedded=true" width="100%" height="600" style="display:none; border:none;"></iframe>
+    <iframe id="testIframe" src="https://docs.google.com/forms/YOUR_GOOGLE_FORM_ID/viewform?embedded=true" width="100%" height="600" style="display:none; border:none;"></iframe>
     <div id="status" class="alert alert-warning mt-3"></div>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <script src="https://html2canvas.hertzen.com/dist/html2canvas.min.js"></script>
@@ -326,8 +325,10 @@ STUDENT_HTML = """
 def index():
     return redirect(url_for('login'))
 
-@app.route('/login', methods=['POST'])
+@app.route('/login', methods=['GET', 'POST'])
 def login():
+    if request.method == 'GET':
+        return render_template_string(LOGIN_HTML)
     data = request.json
     if data['username'] == TEACHER_USER and data['password'] == TEACHER_PASS:
         session['is_teacher'] = True
@@ -373,7 +374,7 @@ def upload_chunk():
 
     try:
         with open(filepath, 'ab') as f:
-            f.seek(chunk_index * (1024 * 1024))  # 1MB chunks
+            f.seek(chunk_index * (1024 * 1024))
             chunk.save(f)
 
         if chunk_index == total_chunks - 1:
@@ -424,7 +425,7 @@ def on_join_student(data):
     emit('student_joined', {'studentId': student_id}, room=exam_id)
     if row and row[0]:
         import json
-        options = json.loads(row[0])  # Safer than eval
+        options = json.loads(row[0])
         emit('options_push', options, to=exam_id)
 
 @socketio.on('start_exam')
