@@ -1,22 +1,3 @@
-# Anti-Cheat Exam Proctoring System (Fixed for Render.com)
-# - Uses gthread worker for gunicorn.
-# - SQLite for exam/student/recording metadata.
-# - Chunked video uploads, periodic screenshots (html2canvas), tab detection.
-# - Bootstrap UI, teacher auth (admin/password), embedded Google Form.
-# - No mobile support, optimized for desktop.
-#
-# Setup:
-# 1. Save as app.py.
-# 2. Create recordings/ folder (use Render Disk for persistence).
-# 3. requirements.txt:
-#     flask==2.3.3
-#     flask-socketio==5.3.6
-#     gunicorn==21.2.0
-#     werkzeug==2.3.7
-#     setuptools==75.2.0
-# 4. Replace YOUR_GOOGLE_FORM_ID in STUDENT_HTML.
-# 5. Deploy to Render.com (see below).
-
 import os
 import uuid
 import sqlite3
@@ -101,6 +82,13 @@ TEACHER_HTML = """
     <meta charset="UTF-8">
     <title>Teacher Dashboard</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .student-card { margin-bottom: 20px; }
+        .status-indicator { font-size: 0.9em; color: #fff; padding: 5px; border-radius: 5px; }
+        .status-active { background-color: green; }
+        .status-tab-changed { background-color: orange; }
+        .status-disconnected { background-color: red; }
+    </style>
 </head>
 <body class="container mt-5">
     <h1>Exam Proctoring Dashboard</h1>
@@ -116,9 +104,9 @@ TEACHER_HTML = """
         <div class="form-check"><label class="form-check-label"><input type="checkbox" class="form-check-input" id="tabDetect"> Detect Tab Change</label></div>
         <div class="form-check"><label class="form-check-label"><input type="checkbox" class="form-check-input" id="record"> Record</label></div>
         <div id="examId" class="alert alert-info mt-3"></div>
-        <div id="students" class="mt-3"></div>
+        <h3>Student Dashboard</h3>
+        <div id="studentDashboard" class="row"></div>
         <div id="recordings" class="mt-3"></div>
-        <div id="proctorFeed" class="row mt-3"></div>
     </div>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
@@ -158,23 +146,43 @@ TEACHER_HTML = """
         });
 
         socket.on('student_joined', (data) => {
-            document.getElementById('students').innerHTML += `<div class="alert alert-success">Student ${data.studentId} joined</div>`;
+            updateStudentCard(data.studentId, 'Joined', 'status-active');
         });
 
         socket.on('tab_change', (data) => {
-            document.getElementById('students').innerHTML += `<div class="alert alert-warning">Student ${data.studentId} changed tab!</div>`;
+            updateStudentCard(data.studentId, 'Tab Changed', 'status-tab-changed');
         });
 
         socket.on('screenshot', (data) => {
-            const col = document.createElement('div');
-            col.className = 'col-md-4';
-            col.innerHTML = `<div class="card"><img src="data:image/png;base64,${data.screenshot}" class="card-img-top" alt="Screenshot from ${data.studentId}"><div class="card-body"><p class="card-text">${data.studentId} - ${data.timestamp}</p></div></div>`;
-            document.getElementById('proctorFeed').appendChild(col);
+            updateStudentCard(data.studentId, 'Active', 'status-active', data.screenshot, data.timestamp);
         });
 
         socket.on('recording_saved', (data) => {
             document.getElementById('recordings').innerHTML += `<div class="alert alert-info">Recording saved: <a href="/download/${data.filename}" target="_blank">${data.filename}</a></div>`;
         });
+
+        socket.on('student_leave', (data) => {
+            updateStudentCard(data.studentId, 'Disconnected', 'status-disconnected');
+        });
+
+        function updateStudentCard(studentId, status, statusClass, screenshot = null, timestamp = null) {
+            let card = document.getElementById(`student-${studentId}`);
+            if (!card) {
+                card = document.createElement('div');
+                card.id = `student-${studentId}`;
+                card.className = 'col-md-4 student-card';
+                document.getElementById('studentDashboard').appendChild(card);
+            }
+            card.innerHTML = `
+                <div class="card">
+                    <div class="card-header">Student ${studentId}</div>
+                    <div class="card-body">
+                        <p>Status: <span class="status-indicator ${statusClass}">${status}</span></p>
+                        ${screenshot ? `<img src="data:image/png;base64,${screenshot}" class="card-img-top" alt="Screenshot" style="max-width: 100%;">` : ''}
+                        ${timestamp ? `<p>Last Update: ${timestamp}</p>` : ''}
+                    </div>
+                </div>`;
+        }
     </script>
 </body>
 </html>
@@ -202,7 +210,7 @@ STUDENT_HTML = """
         const urlParams = new URLSearchParams(window.location.search);
         const examId = urlParams.get('examId');
         const studentId = '{{ student_id }}';
-        if (!examId) { alert('No Exam ID provided'); return; }
+        if (!examId) { alert('No Exam ID provided'); window.location = '/login'; return; }
         socket.emit('join_student', {examId, studentId});
 
         let options = {};
@@ -216,6 +224,7 @@ STUDENT_HTML = """
 
         socket.on('options_push', (data) => {
             options = data;
+            console.log('Received options:', options);
             let html = '<h3>Proctoring Options (Confirm to Start):</h3><ul>';
             for (let key in options) if (options[key]) html += `<li>${key.charAt(0).toUpperCase() + key.slice(1).replace(/([A-Z])/g, ' $1')}</li>`;
             html += '</ul>';
@@ -237,9 +246,18 @@ STUDENT_HTML = """
 
         async function initMedia() {
             try {
-                if (options.camera) streams.camera = await navigator.mediaDevices.getUserMedia({video: true});
-                if (options.mic) streams.mic = await navigator.mediaDevices.getUserMedia({audio: true});
-                if (options.screen) streams.screen = await navigator.mediaDevices.getDisplayMedia({video: true});
+                if (options.camera) {
+                    streams.camera = await navigator.mediaDevices.getUserMedia({video: true});
+                    console.log('Camera access granted');
+                }
+                if (options.mic) {
+                    streams.mic = await navigator.mediaDevices.getUserMedia({audio: true});
+                    console.log('Mic access granted');
+                }
+                if (options.screen) {
+                    streams.screen = await navigator.mediaDevices.getDisplayMedia({video: true});
+                    console.log('Screen share access granted');
+                }
                 
                 const tracks = [];
                 if (streams.camera) tracks.push(...streams.camera.getTracks());
@@ -251,6 +269,7 @@ STUDENT_HTML = """
                     mediaRecorder = new MediaRecorder(combined, {mimeType: 'video/webm'});
                     mediaRecorder.ondataavailable = handleChunk;
                     mediaRecorder.onstop = finalizeUpload;
+                    console.log('MediaRecorder initialized');
                 }
                 
                 if (options.tabDetect) {
@@ -261,6 +280,7 @@ STUDENT_HTML = """
                 
                 setInterval(() => socket.emit('heartbeat', {examId, studentId}), 5000);
             } catch (err) {
+                console.error('Media access error:', err);
                 alert('Media access denied: ' + err.message);
             }
         }
@@ -291,12 +311,15 @@ STUDENT_HTML = """
                 if (data.success && chunkIndex < totalChunks - 1) {
                     uploadChunk(blob, chunkIndex + 1);
                 }
-            }).catch(err => alert('Upload failed: ' + err.message));
+            }).catch(err => {
+                console.error('Upload error:', err);
+                alert('Upload failed: ' + err.message);
+            });
         }
 
         async function captureScreenshot() {
             try {
-                const canvas = await html2canvas(document.body);
+                const canvas = await html2canvas(document.body, {scale: 0.5}); // Reduced scale for performance
                 const dataUrl = canvas.toDataURL('image/png');
                 const screenshot = dataUrl.split(',')[1];
                 socket.emit('screenshot', {examId, studentId, screenshot, timestamp: new Date().toISOString()});
@@ -315,6 +338,7 @@ STUDENT_HTML = """
             alert('Exam ended by teacher.');
             if (mediaRecorder) mediaRecorder.stop();
             if (screenshotInterval) clearInterval(screenshotInterval);
+            window.location = '/login';
         });
     </script>
 </body>
@@ -400,7 +424,7 @@ def on_join_teacher(data):
     exam_id = data.get('examId')
     if exam_id:
         join_room(exam_id)
-        emit('status', {'msg': 'Joined'})
+        emit('status', {'msg': 'Teacher joined'})
 
 @socketio.on('set_exam')
 def set_exam(data):
@@ -461,7 +485,7 @@ def tab_changed(data):
 
 @socketio.on('heartbeat')
 def heartbeat(data):
-    pass
+    emit('status', {'msg': f'Student {data["studentId"]} active'}, room=data['examId'])
 
 @socketio.on('screenshot')
 def screenshot(data):
@@ -477,6 +501,7 @@ def student_leave(data):
     c.execute("DELETE FROM students WHERE id=? AND exam_id=?", (student_id, exam_id))
     conn.commit()
     conn.close()
+    emit('student_leave', {'studentId': student_id}, room=exam_id)
 
 if __name__ == '__main__':
     socketio.run(app, debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
