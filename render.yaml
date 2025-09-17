@@ -2,5 +2,11 @@ services:
   - type: web
     name: proctoring-app
     env: python
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -k eventlet -w 1 --bind 0.0.0.0:$PORT app:app
+    startCommand: gunicorn -k gthread -w 1 --bind 0.0.0.0:$PORT app:app
+    autoDeploy: true
+    disk:
+      name: proctoring-storage
+      mountPath: /opt/render/project/src/recordings
+      sizeGB: 1
